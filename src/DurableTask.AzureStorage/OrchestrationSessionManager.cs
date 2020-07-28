@@ -85,9 +85,73 @@ namespace DurableTask.AzureStorage
                     this.settings.TaskHubName,
                     this.settings.WorkerId,
                     partitionId,
-                    $"Attempted to remove control queue {controlQueue.Name}, which wasn't being watched!",
+                    $"Attempted to remove control queue {partitionId}, which wasn't being watched!",
                     Utils.ExtensionVersion);
             }
+        }
+
+
+        public void ReleaseQueue(string partitionId)
+        {
+            if (this.ownedControlQueues.TryGetValue(partitionId, out ControlQueue controlQueue))
+            {
+                controlQueue.Release();
+            }
+            else
+            {
+                AnalyticsEventSource.Log.PartitionManagerWarning(
+                    this.storageAccountName,
+                    this.settings.TaskHubName,
+                    this.settings.WorkerId,
+                    partitionId,
+                    $"Attempted to release control queue {partitionId}, which wasn't being watched!",
+                    Utils.ExtensionVersion);
+            }
+        }
+
+        public bool TryReaquireQueue(string partitionId)
+        {
+            if (this.ownedControlQueues.TryGetValue(partitionId, out ControlQueue controlQueue))
+            {
+                if (controlQueue.IsReleased)
+                {
+                    controlQueue.Reaquire();
+                    return true;
+                } 
+                else
+                {
+                    AnalyticsEventSource.Log.PartitionManagerWarning(
+                        this.storageAccountName,
+                        this.settings.TaskHubName,
+                        this.settings.WorkerId,
+                        partitionId,
+                        $"Attempted to reaquire control queue {controlQueue.Name}, which wasn't released!",
+                        Utils.ExtensionVersion);
+                }
+            }
+            else
+            {
+                AnalyticsEventSource.Log.PartitionManagerWarning(
+                    this.storageAccountName,
+                    this.settings.TaskHubName,
+                    this.settings.WorkerId,
+                    partitionId,
+                    $"Attempted to reaquire control queue {partitionId}, which wasn't being watched'!",
+                    Utils.ExtensionVersion);
+            }
+
+            return false;
+        }
+
+        public bool IsControlQueueReceivingMessages(string partitionId)
+        {
+            return this.ownedControlQueues.TryGetValue(partitionId, out ControlQueue controlQueue)
+                && !controlQueue.IsReleased;
+        }
+
+        public bool IsControlQueueProcessingMessages(string partitionId)
+        {
+            return this.activeOrchestrationSessions.Values.Where(session => string.Equals(session.ControlQueue.Name, partitionId)).Any();
         }
 
         async void DequeueLoop(string partitionId, ControlQueue controlQueue, CancellationToken cancellationToken)

@@ -40,7 +40,6 @@ namespace DurableTask.AzureStorage
     public sealed class AzureStorageOrchestrationService :
         IOrchestrationService,
         IOrchestrationServiceClient,
-        IPartitionObserver<BlobLease>,
         IDisposable
     {
         static readonly HistoryEvent[] EmptyHistoryEventList = new HistoryEvent[0];
@@ -65,8 +64,10 @@ namespace DurableTask.AzureStorage
         readonly TableEntityConverter tableEntityConverter;
 
         readonly ResettableLazy<Task> taskHubCreator;
-        readonly BlobLeaseManager leaseManager;
-        readonly PartitionManager<BlobLease> partitionManager;
+        readonly BlobLeaseManager intentLeaseManager;
+        readonly LeaseCollectionManager<BlobLease> intentLeaseCollectionManager;
+        readonly BlobLeaseManager ownershipLeaseManager;
+        readonly LeaseCollectionManager<BlobLease> ownershipLeaseCollectionManager;
         readonly OrchestrationSessionManager orchestrationSessionManager;
         readonly object hubCreationLock;
 
@@ -148,30 +149,63 @@ namespace DurableTask.AzureStorage
                 this.GetTaskHubCreatorTask,
                 LazyThreadSafetyMode.ExecutionAndPublication);
 
-            this.leaseManager = GetBlobLeaseManager(
+            this.orchestrationSessionManager = new OrchestrationSessionManager(
+                this.storageAccountName,
+                this.settings,
+                this.stats,
+                this.trackingStore);
+
+            this.intentLeaseManager = GetBlobLeaseManager(
                 settings.TaskHubName,
                 settings.WorkerId,
+                "intent",
                 account,
                 settings.LeaseInterval,
                 settings.LeaseRenewInterval,
                 this.stats);
-            this.partitionManager = new PartitionManager<BlobLease>(
+            this.intentLeaseCollectionManager = new LeaseCollectionManager<BlobLease>(
+                "intent",
                 this.storageAccountName,
                 this.settings.TaskHubName,
                 settings.WorkerId,
-                this.leaseManager,
-                new PartitionManagerOptions
+                this.intentLeaseManager,
+                new LeaseCollectionManagerOptions
                 {
                     AcquireInterval = settings.LeaseAcquireInterval,
                     RenewInterval = settings.LeaseRenewInterval,
                     LeaseInterval = settings.LeaseInterval,
                 });
 
-            this.orchestrationSessionManager = new OrchestrationSessionManager(
+
+            var currentlyOwnedIntentLeases = this.intentLeaseCollectionManager.GetCurrentlyOwnedLeases();
+
+            this.ownershipLeaseManager = GetBlobLeaseManager(
+                settings.TaskHubName,
+                settings.WorkerId,
+                "ownership",
+                account,
+                settings.LeaseInterval,
+                settings.LeaseRenewInterval,
+                this.stats);
+            this.ownershipLeaseCollectionManager = new LeaseCollectionManager<BlobLease>(
+                "ownership",
                 this.storageAccountName,
-                this.settings,
-                this.stats,
-                this.trackingStore);
+                this.settings.TaskHubName,
+                settings.WorkerId,
+                this.ownershipLeaseManager,
+                new LeaseCollectionManagerOptions
+                {
+                    AcquireInterval = TimeSpan.FromSeconds(5),
+                    RenewInterval = TimeSpan.FromSeconds(10),
+                    LeaseInterval = TimeSpan.FromSeconds(15),
+                    ShouldStealLeases = false
+                },
+                shouldAquireLeaseDelegate: leaseKey => currentlyOwnedIntentLeases.ContainsKey(leaseKey),
+                shouldRenewLeaseDelegate: leaseKey => currentlyOwnedIntentLeases.ContainsKey(leaseKey)
+                                                      || this.orchestrationSessionManager.IsControlQueueReceivingMessages(leaseKey)
+                                                      || this.orchestrationSessionManager.IsControlQueueProcessingMessages(leaseKey));
+
+
         }
 
         internal string WorkerId => this.settings.WorkerId;
@@ -230,6 +264,7 @@ namespace DurableTask.AzureStorage
         static BlobLeaseManager GetBlobLeaseManager(
             string taskHub,
             string workerName,
+            string leaseType,
             CloudStorageAccount account,
             TimeSpan leaseInterval,
             TimeSpan renewalInterval,
@@ -240,7 +275,7 @@ namespace DurableTask.AzureStorage
                 workerName: workerName,
                 leaseContainerName: taskHub.ToLowerInvariant() + "-leases",
                 blobPrefix: string.Empty,
-                consumerGroupName: "default",
+                consumerGroupName: leaseType,
                 storageClient: account.CreateCloudBlobClient(),
                 leaseInterval: leaseInterval,
                 renewInterval: renewalInterval,
@@ -337,7 +372,7 @@ namespace DurableTask.AzureStorage
         async Task GetTaskHubCreatorTask()
         {
             TaskHubInfo hubInfo = GetTaskHubInfo(this.settings.TaskHubName, this.settings.PartitionCount);
-            await this.leaseManager.CreateLeaseStoreIfNotExistsAsync(hubInfo);
+            await this.intentLeaseManager.CreateLeaseStoreIfNotExistsAsync(hubInfo);
             this.stats.StorageRequests.Increment();
 
             var tasks = new List<Task>();
@@ -349,7 +384,8 @@ namespace DurableTask.AzureStorage
             foreach (ControlQueue controlQueue in this.allControlQueues.Values)
             {
                 tasks.Add(controlQueue.CreateIfNotExistsAsync());
-                tasks.Add(this.leaseManager.CreateLeaseIfNotExistAsync(controlQueue.Name));
+                tasks.Add(this.intentLeaseManager.CreateLeaseIfNotExistAsync(controlQueue.Name));
+                tasks.Add(this.ownershipLeaseManager.CreateLeaseIfNotExistAsync(controlQueue.Name));
             }
 
             await Task.WhenAll(tasks.ToArray());
@@ -397,7 +433,23 @@ namespace DurableTask.AzureStorage
                 tasks.Add(DeleteTrackingStore());
             }
 
-            tasks.Add(this.leaseManager.DeleteAllAsync().ContinueWith(t =>
+            tasks.Add(this.intentLeaseManager.DeleteAllAsync().ContinueWith(t =>
+            {
+                if (t.Exception?.InnerExceptions?.Count > 0)
+                {
+                    foreach (Exception e in t.Exception.InnerExceptions)
+                    {
+                        StorageException storageException = e as StorageException;
+                        if (storageException == null || storageException.RequestInformation.HttpStatusCode != 404)
+                        {
+                            ExceptionDispatchInfo.Capture(e).Throw();
+                        }
+                    }
+                }
+            }));
+
+
+            tasks.Add(this.ownershipLeaseManager.DeleteAllAsync().ContinueWith(t =>
             {
                 if (t.Exception?.InnerExceptions?.Count > 0)
                 {
@@ -443,9 +495,17 @@ namespace DurableTask.AzureStorage
             this.shutdownSource = new CancellationTokenSource();
             this.statsLoop = Task.Run(() => this.ReportStatsLoop(this.shutdownSource.Token));
 
-            await this.partitionManager.InitializeAsync();
-            await this.partitionManager.SubscribeAsync(this);
-            await this.partitionManager.StartAsync();
+            await this.intentLeaseCollectionManager.InitializeAsync();
+            await this.intentLeaseCollectionManager.SubscribeAsync(
+                this.OnIntentLeaseAquiredAsync,
+                this.OnIntentLeaseReleasedAsync);
+            await this.intentLeaseCollectionManager.StartAsync();
+
+            await this.ownershipLeaseCollectionManager.InitializeAsync();
+            await this.ownershipLeaseCollectionManager.SubscribeAsync(
+                this.OnOwnershipLeaseAquiredAsync,
+                this.OnOwnershipLeaseReleasedAsync);
+            await this.ownershipLeaseCollectionManager.StartAsync();
 
             this.isStarted = true;
         }
@@ -461,7 +521,7 @@ namespace DurableTask.AzureStorage
         {
             this.shutdownSource.Cancel();
             await this.statsLoop;
-            await this.partitionManager.StopAsync();
+            await this.intentLeaseCollectionManager.StopAsync();
             this.isStarted = false;
         }
 
@@ -525,7 +585,20 @@ namespace DurableTask.AzureStorage
                 Utils.ExtensionVersion);
         }
 
-        async Task IPartitionObserver<BlobLease>.OnPartitionAcquiredAsync(BlobLease lease)
+        Task OnIntentLeaseAquiredAsync(BlobLease lease)
+        {
+            this.orchestrationSessionManager.TryReaquireQueue(lease.PartitionId);
+            return Utils.CompletedTask;
+        }
+
+        Task OnIntentLeaseReleasedAsync(BlobLease lease, CloseReason reason)
+        {
+            // Mark the queue as released so it will stop grabbing new messages.
+            this.orchestrationSessionManager.ReleaseQueue(lease.PartitionId);
+            return Utils.CompletedTask;
+        }
+
+        async Task OnOwnershipLeaseAquiredAsync(BlobLease lease)
         {
             CloudQueue storageQueue = this.queueClient.GetQueueReference(lease.PartitionId);
             await storageQueue.CreateIfNotExistsAsync();
@@ -537,7 +610,7 @@ namespace DurableTask.AzureStorage
             this.allControlQueues[lease.PartitionId] = controlQueue;
         }
 
-        Task IPartitionObserver<BlobLease>.OnPartitionReleasedAsync(BlobLease lease, CloseReason reason)
+        Task OnOwnershipLeaseReleasedAsync(BlobLease lease, CloseReason reason)
         {
             this.orchestrationSessionManager.RemoveQueue(lease.PartitionId);
             return Utils.CompletedTask;
@@ -546,7 +619,7 @@ namespace DurableTask.AzureStorage
         // Used for testing
         internal Task<IEnumerable<BlobLease>> ListBlobLeasesAsync()
         {
-            return this.leaseManager.ListLeasesAsync();
+            return this.intentLeaseManager.ListLeasesAsync();
         }
 
         internal static async Task<CloudQueue[]> GetControlQueuesAsync(
@@ -564,7 +637,7 @@ namespace DurableTask.AzureStorage
                 throw new ArgumentNullException(nameof(taskHub));
             }
 
-            BlobLeaseManager inactiveLeaseManager = GetBlobLeaseManager(taskHub, "n/a", account, TimeSpan.Zero, TimeSpan.Zero, null);
+            BlobLeaseManager inactiveLeaseManager = GetBlobLeaseManager(taskHub, "n/a", "inactive", account, TimeSpan.Zero, TimeSpan.Zero, null);
             TaskHubInfo hubInfo = await inactiveLeaseManager.GetOrCreateTaskHubInfoAsync(
                 GetTaskHubInfo(taskHub, defaultPartitionCount));
 
